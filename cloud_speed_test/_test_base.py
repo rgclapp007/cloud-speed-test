@@ -30,7 +30,7 @@ class run_test(ABC):
         self.docker_start_time=70
 
     @abstractmethod
-    def create_instance_command(slf,machine_type,instance_name):
+    def create_instance_command(self,machine_type,instance_name,image_family="debian-10"):
         pass
 
     @abstractmethod
@@ -55,62 +55,89 @@ class run_test(ABC):
         if mem<self._min_mem: return False
         if cpus<self._min_cpus: return False
         return True
-
-def run_single_test(row_data, test,verbose=0):
-    # Unpack row data
-    dv = {'NAME': row_data['NAME'], 'CPUS': row_data['CPUS'], 'MEMORY_GB': row_data['MEMORY_GB']}
     
-    if test.valid_job(dv["NAME"], dv["CPUS"], dv["MEMORY_GB"]):
-        instance_name = test.valid_machine_name(dv["NAME"])
-        result=run_check_command(test.create_instance_command(dv["NAME"], instance_name),verbose)
-        if verbose>1:
-            print(f"{instance_name} sleeping for docker to be installed")
-        time.sleep(120)
-        speed=test.parse_output(run_check_command(
-            test.run_docker_command(instance_name,test._docker,test.add_threads(test._base_args,
-                                                                  int(dv["CPUS"] / 2))),verbose))
-        run_check_command(test.delete_instance_command(instance_name),verbose)
-        if verbose >0: print(f"Finished testing {dv['NAME']} in {speed}")
-        return speed
-    else:
-        if verbose >0: print(f"Not running on {dv['NAME']}")
-        return -999.
+def add_test(df, test, max_workers=45, verbose=0, retry_delay=90, max_retries=3):
+    if 'Machine Type' not in df.columns:
+        raise ValueError("DataFrame must contain a 'Machine Type' column")
+    
+    retry_queue = []
+    retries = 0
 
-def add_test(df, test,verbose=0):
-    # Ensure 'NAME' column exists
-    if 'NAME' not in df.columns:
-        raise ValueError("DataFrame must contain a 'NAME' column")
-
-    # Specify 8 workers for the ProcessPoolExecutor
-    with ProcessPoolExecutor(max_workers=8) as executor:
-        # Prepare data for multiprocessing
-        # Note: Ensure we're not modifying the original DataFrame's structure
-        rows_data = df[['NAME', 'CPUS', 'MEMORY_GB']].head(8).to_dict('records')
-        
-        # Execute the processing in parallel
-        speeds = list(executor.map(run_single_test, rows_data, [test]*len(rows_data),[verbose]*len(rows_data)))
-        
-    # Update the DataFrame with the speeds
-    for row_data, speed in zip(rows_data, speeds):
-        df.loc[df['NAME'] == row_data['NAME'], test._test_name] = speed
+    while True:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # Prepare tasks, either initial or retry queue
+            tasks = retry_queue if retries > 0 else df[['Machine Type', 'CPUs', 'Memory (GiB)', 'GPUs']].to_dict('records')
+            retry_queue = []  # Reset retry queue
+            
+            # Execute the processing in parallel
+            results = list(executor.map(run_single_test, tasks, [test]*len(tasks), [verbose]*len(tasks)))
+            
+            # Process results and populate retry queue if necessary
+            for row_data, (status, speed) in zip(tasks, results):
+                if status == 'success':
+                    df.loc[df['Machine Type'] == row_data['Machine Type'], test._test_name] = speed
+                elif status == 'unavailable' and retries < max_retries:
+                    retry_queue.append(row_data)
+                else:       
+                    retry_queue.append(row_data)
+        if not retry_queue or retries >= max_retries:
+            break
+        else:
+            retries += 1
+            if verbose > 0: print(f"Retrying. Attempt {retries}/{max_retries}")
+            time.sleep(retry_delay)  # Wait before retrying
+    
+    if retries >= max_retries:
+        for row_data in retry_queue:
+            df.loc[df['Machine Type'] == row_data['Machine Type'], test._test_name] = 'Unavailable after retries'
+    
     return df
 
+def run_single_test(row_data, test, verbose=0):
+    # Initialize status and speed
+    status = 'success'
+    speed = -999.
+    
+    # Unpack row data
+    dv = {'Machine Type': row_data['Machine Type'], 'CPUs': row_data['CPUs'], 'Memory (GiB)': row_data['Memory (GiB)']}
+    
+    if test.valid_job(dv["Machine Type"], dv["CPUs"], dv["Memory (GiB)"]):
+        instance_name = test.valid_machine_name(dv["Machine Type"])
+        create_result = run_check_command(test.create_instance_command(dv["Machine Type"], instance_name), verbose)
+        if create_result is None:
+            status = "failed"
+        else:
+            if "unavailable" in create_result.lower():  # Simulated check for unavailability
+                status = 'unavailable'
+            else:
+                if verbose > 1:
+                    print(f"{instance_name} sleeping for docker to be installed")
+                time.sleep(120)
+                speed = test.parse_output(run_check_command(
+                    test.run_docker_command(instance_name, test._docker, test.add_threads(test._base_args, int(dv["CPUs"] / 2))), verbose))
+                run_check_command(test.delete_instance_command(instance_name), verbose)
+                if verbose > 0: print(f"Finished testing {dv['Machine Type']} in {speed}")
+    else:
+        if verbose > 0: print(f"Not running on {dv['Machine Type']}")
+        status = 'invalid'
+    
+    return status, speed
 def test_run(df, test, mach):
     # Ensure 'NAME' is the DataFrame's index for direct access
-    if 'NAME' not in df.index.names:
-        df = df.set_index('NAME')
+    if 'Machine Type' not in df.index.names:
+        df = df.set_index('Machine Type')
 
     # Check if the machine name exists in the DataFrame
     if mach in df.index:
-        one_row = df.loc[mach, ['CPUS', 'MEMORY_GB']].to_dict()
+        one_row = df.loc[mach, ['CPUs', 'Memory (GiB)']].to_dict()
         
         # Assuming 'NAME' is the index, you don't need to extract it again from the row
-        one_row['NAME'] = mach
+        one_row['Machine Type'] = mach
         
-        if test.valid_job(one_row["NAME"], one_row["CPUS"], one_row["MEMORY_GB"]):
-            instance_name = test.valid_machine_name(one_row["NAME"])
-            print(f"{' '.join(test.create_instance_command(one_row['NAME'], instance_name,True))}")
-            nth_command = test.add_threads(test._base_args, int(one_row['CPUS'] / 2))
+        if test.valid_job(one_row["Machine Type"], one_row["CPUs"], one_row["Memory (GiB)"]):
+            instance_name = test.valid_machine_name(one_row["Machine Type"])
+            print(f"{' '.join(test.create_instance_command(one_row['Machine Type'], instance_name,True))}")
+            nth_command = test.add_threads(test._base_args, int(one_row['CPUs'] / 2))
             print(f"{test.run_docker_command(instance_name, test._docker, nth_command)}")
             print(f"{' '.join(test.delete_instance_command(instance_name))}")
     else:

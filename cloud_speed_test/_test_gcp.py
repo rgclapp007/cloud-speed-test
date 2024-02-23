@@ -2,6 +2,26 @@ import subprocess
 from  ._test_base import run_test
 
 
+import pandas as pd
+from google.cloud import compute_v1
+
+def gcp_machines_from_zone(project_id, zone):
+    client = compute_v1.MachineTypesClient()
+    machine_types_data = []
+
+    request = compute_v1.ListMachineTypesRequest(project=project_id, zone=zone)
+    for machine_type in client.list(request=request):
+        data = {
+            "Machine Type": machine_type.name,
+            "CPUs": machine_type.guest_cpus,
+            "Memory (GiB)": machine_type.memory_mb / 1024,  # Convert MB to GiB
+            "GPUs": 0  # Default to 0, adjust below if GPU info is available
+        }
+        # Assuming GPU info needs to be manually adjusted since it's not directly available from machine_type
+        machine_types_data.append(data)
+
+    df = pd.DataFrame(machine_types_data)
+    return df
 
 class run_gcp_test(run_test):
     def __init__(self,test_name,docker,base_args,project,zone,min_cores=0,min_mem=0):
@@ -10,11 +30,11 @@ class run_gcp_test(run_test):
         self._project=project
         self._zone=zone
 
-    def create_instance_command(self,machine_type, instance_name,wrap=False):
+    def create_instance_command(self,machine_type, instance_name,image_family="debian-12",wrap=False):
         res=[
         "gcloud", "compute", "instances", "create", instance_name,
         "--machine-type", machine_type,
-        "--image-family", "debian-10",
+        "--image-family", image_family,
         "--image-project", "debian-cloud",
         "--zone", self._zone,
         "--project", self._project]
@@ -45,14 +65,3 @@ class run_gcp_test(run_test):
         return instance_name
 
 
-            
-def gcp_machines_from_zone(zone):
-    result=subprocess.run([
-        "gcloud", "compute", "machine-types", "list",
-        "--zones=us-central1-c" ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True, check=True)
-    gcloud_output=result.stdout
-    df = pd.read_csv(StringIO(gcloud_output), sep="\s+", skipinitialspace=True)
-    return df

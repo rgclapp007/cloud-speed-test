@@ -6,7 +6,9 @@ authors = [
     { name = "Bob Clapp", email = "clapp@stanford.edu" }
 ]
 
-
+dependencies=[ 'google-cloud-compute>=1.10.0',
+                'pandas>=2.0',
+            ]
 [build-system]
 build-backend = "flit_core.buildapi"
 requires = ["flit_core >=3.2,<4"]
